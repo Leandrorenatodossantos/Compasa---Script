@@ -19,6 +19,7 @@ env/
 *.pem
 *.key
 *.pfx
+*.env
 
 # Dados e exports
 *.csv
