@@ -20,6 +20,10 @@ env/
 *.key
 *.pfx
 *.env
+.env
+.venv/
+__pycache__/
+*.pyc
 
 # Dados e exports
 *.csv
