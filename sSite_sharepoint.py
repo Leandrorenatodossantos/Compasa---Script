@@ -10,9 +10,13 @@ from dash.dependencies import Input, Output
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.io as pio
+# import dash_daq as daq
+
+import plotly.graph_objects as go
 
 from dotenv import load_dotenv
 load_dotenv()
+import os
 
 # Tema dark para os gráficos
 pio.templates.default = "plotly_dark"
@@ -37,6 +41,31 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0/"
 # ====================================================
 # HELPERS GERAIS PARA O GRAPH
 # ====================================================
+
+def metric_storage_total(period: str = "D30") -> dict:
+    """
+    Usa o report getSharePointSiteUsageStorage para pegar 'used' (real),
+    e usa SPO_TOTAL_TB (env) como capacidade total do tenant.
+    """
+    df = download_graph_report(
+        f"reports/getSharePointSiteUsageStorage(period='{period}')"
+    )
+
+    if df.empty or "Storage Used (Byte)" not in df.columns:
+        return {"percent_used": None, "used_tb": None, "allocated_tb": None}
+
+    used_bytes = float(df["Storage Used (Byte)"].iloc[-1])
+    used_tb = used_bytes / 1024**4
+
+    allocated_tb = os.getenv("SPO_TOTAL_TB")
+    allocated_tb = float(allocated_tb) if allocated_tb else None
+
+    if not allocated_tb or allocated_tb <= 0:
+        return {"percent_used": None, "used_tb": used_tb, "allocated_tb": None}
+
+    percent_used = (used_tb / allocated_tb) * 100
+    return {"percent_used": float(percent_used), "used_tb": float(used_tb), "allocated_tb": float(allocated_tb)}
+
 
 def get_token_header() -> dict:
     token = credential.get_token("https://graph.microsoft.com/.default").token
@@ -849,6 +878,14 @@ external_stylesheets = [dbc.themes.CYBORG]  # tema escuro
 app = Dash(__name__, external_stylesheets=external_stylesheets)
 server = app.server
 
+import dash_auth
+
+VALID_USERNAME_PASSWORD_PAIRS = {
+    os.getenv("DASH_USER", "admin"): os.getenv("DASH_PASS", "C0mp@admin")
+}
+
+auth = dash_auth.BasicAuth(app, VALID_USERNAME_PASSWORD_PAIRS)
+
 # Estilos para DataTable em tema escuro
 datatable_dark_style = dict(
     style_header={
@@ -1080,22 +1117,10 @@ app.layout = dbc.Container(
                                         dcc.Dropdown(
                                             id="periodo-storage",
                                             options=[
-                                                {
-                                                    "label": "Últimos 7 dias",
-                                                    "value": "D7",
-                                                },
-                                                {
-                                                    "label": "Últimos 30 dias",
-                                                    "value": "D30",
-                                                },
-                                                {
-                                                    "label": "Últimos 90 dias",
-                                                    "value": "D90",
-                                                },
-                                                {
-                                                    "label": "Últimos 180 dias",
-                                                    "value": "D180",
-                                                },
+                                                {"label": "Últimos 7 dias", "value": "D7"},
+                                                {"label": "Últimos 30 dias", "value": "D30"},
+                                                {"label": "Últimos 90 dias", "value": "D90"},
+                                                {"label": "Últimos 180 dias", "value": "D180"},
                                             ],
                                             value="D30",
                                             clearable=False,
@@ -1107,7 +1132,52 @@ app.layout = dbc.Container(
                             ],
                             className="mb-3",
                         ),
-                        dcc.Graph(id="graf-storage-trend"),
+                        # ======= ROW COM 2 CARDS (TREND + RESUMO) =======
+                        dbc.Row(
+                            [
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Tendência de uso", style={"color": "#ffffff"}),
+                                                dcc.Graph(id="graf-storage-trend", config={"displayModeBar": False}),
+                                            ]
+                                        ),
+                                        style={"backgroundColor": "#1E1E1E", "border": "1px solid #333"},
+                                        className="mb-3",
+                                    ),
+                                    md=8,
+                                ),
+                                dbc.Col(
+                                    dbc.Card(
+                                        dbc.CardBody(
+                                            [
+                                                html.H5("Uso total", style={"color": "#ffffff"}),
+                                                html.Div(
+                                                    [
+                                                        html.Div(id="txt-storage-pct", style={"fontSize": "28px", "fontWeight": "bold", "color": "white"}),
+                                                        html.Div(id="txt-storage-tb", style={"fontSize": "14px", "color": "#CCCCCC", "marginBottom": "12px"}),
+                                                        dbc.Progress(
+                                                            id="prog-storage",
+                                                            value=0,
+                                                            max=100,
+                                                            striped=False,
+                                                            animated=False,
+                                                            style={"height": "18px"},
+                                                            className="mb-2",
+                                                        ),
+                                                        html.Div(id="txt-storage-restante", style={"fontSize": "12px", "color": "#AAAAAA"}),
+                                                    ]
+                                                ),
+                                            ]
+                                        ),
+                                        style={"backgroundColor": "#1E1E1E", "border": "1px solid #333"},
+                                        className="mb-3",
+                                    ),
+                                    md=4,
+                                ),
+                            ]
+                        ),
                     ],
                 ),
                 # ----------------------------- TAB 3: Inventário Usuários -----------------------------
@@ -1325,22 +1395,44 @@ app.layout = dbc.Container(
 
 @app.callback(
     Output("graf-storage-trend", "figure"),
+    Output("prog-storage", "value"),
+    Output("txt-storage-pct", "children"),
+    Output("txt-storage-tb", "children"),
+    Output("txt-storage-restante", "children"),
     Input("periodo-storage", "value"),
 )
 def atualizar_grafico_storage(periodo):
+    # --------- Trend ----------
     df = metric_storage_trend(periodo)
     if df.empty:
-        return px.line(title="Nenhum dado retornado")
+        fig_trend = px.line(title="Nenhum dado retornado")
+    else:
+        fig_trend = px.line(
+            df,
+            x="Report Date",
+            y="Storage Used (GB)",
+            title=f"Uso de Storage do SharePoint ({periodo})",
+        )
+        fig_trend.update_layout(xaxis_title="Data", yaxis_title="Storage (GB)")
 
-    fig = px.line(
-        df,
-        x="Report Date",
-        y="Storage Used (GB)",
-        title=f"Uso de Storage do SharePoint ({periodo})",
-    )
-    fig.update_layout(xaxis_title="Data", yaxis_title="Storage (GB)")
-    return fig
+    # --------- Uso total ----------
+    resumo = metric_storage_total(periodo)
 
+    # Se faltou SPO_TOTAL_TB no .env ou não veio dado do report
+    if resumo["percent_used"] is None:
+        return fig_trend, 0, "Sem dados", "Defina SPO_TOTAL_TB no .env (ex: 4.42)", ""
+
+    pct = round(resumo["percent_used"], 2)
+    used_tb = resumo["used_tb"]
+    alloc_tb = resumo["allocated_tb"]
+    free_tb = max(alloc_tb - used_tb, 0)
+    free_gb = free_tb * 1024
+
+    txt_pct = f"{pct}% do armazenamento total usado"
+    txt_tb = f"{used_tb:.2f} TB / {alloc_tb:.2f} TB usados"
+    txt_rest = f"Disponível: {free_gb:.2f} GB"
+
+    return fig_trend, pct, txt_pct, txt_tb, txt_rest
 
 @app.callback(
     Output("graf-licenca-sku", "figure"),
