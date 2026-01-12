@@ -507,6 +507,112 @@ def build_figures(dff: pd.DataFrame):
     fig_timeline = build_timeline_figure(dff)
     return fig_status, fig_nivel, fig_aprov, fig_periodo, fig_timeline
 
+def build_produto_sd1_vertical(dff_main: pd.DataFrame, dff_sd1: pd.DataFrame, top_n: int = 10, width: int = 450):
+    if dff_main.empty or dff_sd1.empty:
+        fig = px.bar(pd.DataFrame({"Produto": [], "VALOR_SD1": []}), x="Produto", y="VALOR_SD1")
+        fig.update_layout(template="plotly_white", title=None, width=width, height=420, margin=dict(l=14, r=14, t=10, b=90))
+        return fig
+
+    needed_main = {"NUM_DOCUMENTO", "C7_DESCRI"}
+    needed_sd1 = {"NUM_DOCUMENTO", "VALOR_SD1"}
+    if not needed_main.issubset(dff_main.columns) or not needed_sd1.issubset(dff_sd1.columns):
+        fig = px.bar(
+            pd.DataFrame({"Produto": [], "VALOR_SD1": []}),
+            x="VALOR_SD1",
+            y="Produto",
+            orientation="v",
+        )
+        fig.update_layout(
+            template="plotly_white",
+            title=None,
+            width=width,
+            height=420,
+            margin={"l": 14, "r": 14, "t": 10, "b": 90}
+        )
+        return fig
+
+    # SD1 por documento
+    sd1_doc = (
+        dff_sd1.groupby("NUM_DOCUMENTO", as_index=False)["VALOR_SD1"]
+        .sum()
+        .rename(columns={"VALOR_SD1": "VALOR_SD1_DOC"})
+    )
+
+    # Documento -> Produto (MAIN)
+    doc_prod = dff_main[["NUM_DOCUMENTO", "C7_DESCRI"]].dropna().copy()
+    doc_prod["NUM_DOCUMENTO"] = doc_prod["NUM_DOCUMENTO"].astype(str).str.strip()
+    doc_prod["C7_DESCRI"] = doc_prod["C7_DESCRI"].astype(str).str.strip()
+
+    base = doc_prod.merge(sd1_doc, on="NUM_DOCUMENTO", how="inner")
+    if base.empty:
+        fig = px.bar(pd.DataFrame({"Produto": [], "VALOR_SD1": []}), x="Produto", y="VALOR_SD1")
+        fig.update_layout(template="plotly_white", title=None, width=width, height=470, margin=dict(l=14, r=14, t=10, b=90))
+        return fig
+
+    # Top 10 por produto
+    prod = (
+        base.groupby("C7_DESCRI", as_index=False)["VALOR_SD1_DOC"]
+        .sum()
+        .sort_values("VALOR_SD1_DOC", ascending=False)
+        .head(top_n)
+        .rename(columns={"C7_DESCRI": "Produto_full", "VALOR_SD1_DOC": "VALOR_SD1"})
+    )
+
+    # nome curto (bem curto) + índice para evitar repetição visual
+    def short_label(s: str, max_len: int = 12) -> str:
+        s = str(s).strip()
+        return s if len(s) <= max_len else (s[:max_len - 1] + "…")
+
+    prod["Produto_curto"] = prod["Produto_full"].apply(short_label)
+    prod["Produto_x"] = [f"{i+1:02d} - {p}" for i, p in enumerate(prod["Produto_curto"].tolist())]
+    order = prod["Produto_x"].tolist()
+
+    fig = px.bar(
+        prod,
+        x="Produto_x",
+        y="VALOR_SD1",
+        custom_data=["Produto_full"],
+        category_orders={"Produto_x": order},
+        orientation="v",
+    )
+
+    fig.update_traces(
+        hovertemplate=(
+            "<b>Produto:</b> %{customdata[0]}<br>"
+            "<b>Valor SD1:</b> " + "%{y:,.2f}<br>"
+            "<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        title=None,
+        width=width,
+        height=450,
+        margin=dict(l=14, r=14, t=10, b=100),
+        bargap=0.25,
+        showlegend=False,
+        font=dict(size=12),
+    )
+
+    fig.update_yaxes(
+        title="Valor SD1",
+        tickformat="~s",                # 500M / 1G / 3G etc
+        gridcolor="rgba(0,0,0,0.08)",
+        zeroline=False,
+    )
+
+    fig.update_xaxes(
+        title="Produto (Top 10)",
+        tickangle=45,
+        tickfont=dict(size=10),
+        automargin=True,
+        categoryorder="array",
+        categoryarray=order,
+    )
+
+    return fig
+
 # =========================================================
 # 5) PIVOT SD1
 # =========================================================
@@ -688,7 +794,7 @@ main_content = html.Div(
         dbc.Row(
             [
                 dbc.Col(card_com_header("Por Status", "g_status"), md=3),
-                dbc.Col(card_com_header("Por Nível", "g_nivel"), md=3),
+                dbc.Col(card_com_header("Produto (Top 10 por Valor SD1)", "g_nivel"), md=3),
                 dbc.Col(card_com_header("Pendências por Aprovador (Top 15)", "g_aprovador"), md=3),
                 dbc.Col(card_com_header("Pedidos por Período", "g_periodo"), md=3),
             ],
@@ -1003,6 +1109,23 @@ def update_all(store_main, store_sd1, f_fornecedor, f_cc, f_descr_cc, f_pedido, 
         valor_sd1_total = float(
             dff_sd1.get("VALOR_SALDO", 0).sum()
         ) if not dff_sd1.empty else 0.0
+        
+        if f_produto and "C7_DESCRI" in dff.columns:
+            dff = dff[dff["C7_DESCRI"].astype(str).isin([str(x) for x in f_produto])]
+
+        # propaga produto para SD1 via documento
+        if (
+            (not dff.empty)
+            and f_produto
+            and ("NUM_DOCUMENTO" in dff.columns)
+            and ("NUM_DOCUMENTO" in dff_sd1.columns)
+        ):
+            docs_prod = (
+                dff["NUM_DOCUMENTO"].astype(str).str.strip()
+                .replace({"": np.nan, "None": np.nan, "nan": np.nan})
+                .dropna().unique().tolist()
+            )
+            dff_sd1 = dff_sd1[dff_sd1["NUM_DOCUMENTO"].astype(str).str.strip().isin(docs_prod)] if docs_prod else dff_sd1.iloc[0:0]
 
     agora = pd.Timestamp.now().strftime("%d/%m/%Y %H:%M:%S")
     q_main = br_int(len(dff))
@@ -1048,7 +1171,8 @@ def update_all(store_main, store_sd1, f_fornecedor, f_cc, f_descr_cc, f_pedido, 
     k3 = kpi_card("Aprovados (linhas)", f"{aprovados:,}".replace(",", "."), icon="bi bi-check2-circle")
     k4 = kpi_card("Níveis (distintos)", f"{niveis:,}".replace(",", "."), icon="bi bi-diagram-3")
 
-    fig_status, fig_nivel, fig_aprov, fig_periodo, fig_timeline = build_figures(dff)
+    fig_status, _fig_nivel, fig_aprov, fig_periodo, fig_timeline = build_figures(dff)
+    fig_nivel = build_produto_sd1_vertical(dff, dff_sd1, top_n=10, width=450)
 
 # ========= FIG AGING =========
     if dff_sd1.empty:
@@ -1164,7 +1288,7 @@ def update_all(store_main, store_sd1, f_fornecedor, f_cc, f_descr_cc, f_pedido, 
         total_fin = float(pd.to_numeric(dff_sd1.get("VALOR_FINANCEIRO", 0), errors="coerce").fillna(0).sum())
         saldo_aberto = float(pd.to_numeric(dff_sd1.get("VALOR_SALDO", 0), errors="coerce").fillna(0).sum())
 
-    k_fin1 = kpi_card("Custo total, nos últimos 12 meses", format_rs(total_fin), icon="bi bi-calculator")
+    k_fin1 = kpi_card("Custo total, no Período", format_rs(total_fin), icon="bi bi-calculator")
     k_fin2 = kpi_card("Saldo em aberto", format_rs(saldo_aberto), icon="bi bi-wallet2")
     k_fin3 = kpi_card("Vencido (saldo)", format_rs(saldo_atraso), icon="bi bi-exclamation-triangle")
     
